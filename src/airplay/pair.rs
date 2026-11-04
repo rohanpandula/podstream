@@ -83,9 +83,10 @@ impl PairSetupClient {
         }
         let salt = tlv.get(0x02).context("M2: no salt")?.to_vec();
         let b_pub = tlv.get(0x03).context("M2: no server public key")?.to_vec();
-        if b_pub.len() != 384 {
-            bail!("M2: expected 384-byte SRP public key, got {}", b_pub.len());
-        }
+        // Pad B to the group width (server may send a leading-zero-stripped value).
+        let mut b_pub_padded = vec![0u8; 384 - b_pub.len().min(384)];
+        b_pub_padded.extend_from_slice(&b_pub);
+        let b_pub = b_pub_padded;
 
         // Apple's HomeKit SRP-6a variant (SHA-512, 3072-bit group, transient PIN).
         let a: [u8; 64] = rand::random();
@@ -128,11 +129,17 @@ impl PairSetupClient {
         Ok(PairingKeys { read_key, write_key })
     }
 
-    /// Take the raw TCP stream (after pairing) and wrap it in the
-    /// encrypted control channel.
-    pub fn into_encrypted(self) -> EncryptedChannel {
-        let w = self.write_key.expect("pair() first");
-        let r = self.read_key.expect("pair() first");
-        EncryptedChannel::new(self.client.into_stream(), w, r)
+    /// Pair, then wrap the connection in the encrypted control channel.
+    pub fn into_encrypted_after_pair(mut self) -> Result<EncryptedChannel> {
+        self.pair()?;
+        let w = self.write_key.context("pair() first")?;
+        let r = self.read_key.context("pair() first")?;
+        let ip = self.client.local_ip()?;
+        Ok((EncryptedChannel::new(self.client.into_stream(), w, r), ip).0)
+    }
+
+    /// The sender's local IP (used in the RTSP URI).
+    pub fn local_ip(&self) -> std::io::Result<std::net::IpAddr> {
+        self.client.local_ip()
     }
 }

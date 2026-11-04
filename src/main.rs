@@ -34,6 +34,8 @@ enum Command {
     Pair {
         host: String,
     },
+    /// Pair, negotiate the session (both SETUP phases), report ports
+    Setup { host: String },
     /// Pair and send one encrypted request over the control channel
     Probe {
         host: String,
@@ -62,6 +64,12 @@ enum Command {
     },
 }
 
+fn channel_local_ip(_c: &airplay::crypto::EncryptedChannel) -> String {
+    let sock = std::net::UdpSocket::bind("0.0.0.0:0").unwrap();
+    sock.connect("10.0.0.204:7000").unwrap();
+    sock.local_addr().unwrap().ip().to_string()
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -87,14 +95,55 @@ async fn main() -> Result<()> {
             );
             Ok(())
         }
+        Command::Setup { host } => {
+            let (host, port) = match host.rsplit_once(':') {
+                Some((h, p)) => (h.to_string(), p.parse::<u16>().unwrap_or(7000)),
+                None => (host, 7000),
+            };
+            let pair = airplay::pair::PairSetupClient::new(&host, port)?;
+
+            // Sender-side UDP sockets: timing (NTP replies) and control (RTCP).
+            let timing = std::net::UdpSocket::bind("0.0.0.0:0")?;
+            let timing_port = timing.local_addr()?.port();
+            let _timing_stop = airplay::timing::spawn_responder(timing);
+            let control = std::net::UdpSocket::bind("0.0.0.0:0")?;
+            let control_port = control.local_addr()?.port();
+
+            let device_id = "AA:BB:CC:DD:EE:FF".to_string();
+            let channel = pair.into_encrypted_after_pair()?;
+            let local_ip = channel_local_ip(&channel);
+            let mut session = airplay::session::Session::new(
+                channel,
+                &host,
+                port,
+                local_ip,
+                device_id,
+            );
+            session.setup_phase1(timing_port)?;
+            println!(
+                "SETUP phase 1 OK: event_port={:?} timing_port={:?}",
+                session.event_port, session.timing_port
+            );
+            let events = session.connect_events();
+            println!("event channel: {:?}", events.is_ok());
+            let _events_keepalive = events;
+
+            let shk: [u8; 32] = rand::random();
+            session.setup_phase2(control_port, shk)?;
+            session.record()?;
+            println!(
+                "SETUP phase 2 OK: data_port={:?} control_port={:?} event_port={:?}",
+                session.data_port, session.control_port, session.event_port
+            );
+            Ok(())
+        }
         Command::Probe { host } => {
             let (host, port) = match host.rsplit_once(':') {
                 Some((h, p)) => (h.to_string(), p.parse::<u16>().unwrap_or(7000)),
                 None => (host, 7000),
             };
-            let mut pair = airplay::pair::PairSetupClient::new(&host, port)?;
-            let _keys = pair.pair()?;
-            let mut channel = pair.into_encrypted();
+            let pair = airplay::pair::PairSetupClient::new(&host, port)?;
+            let mut channel = pair.into_encrypted_after_pair()?;
             // POST /feedback is used as a keepalive; any authenticated
             // reply proves the whole encrypted channel works.
             let resp = channel.request("POST", "/feedback", &[], b"")?;

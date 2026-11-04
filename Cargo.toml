@@ -5,6 +5,7 @@ edition = "2021"
 description = "Stream macOS system audio to AirPlay receivers (HomePod) with low latency, from the CLI"
 
 [dependencies]
+alac-encoder = "0.3.0"
 anyhow = "1"
 base64 = "0.23.1"
 block2 = "0.6.2"
@@ -16,6 +17,7 @@ mdns-sd = "0.13"
 num-bigint = "0.5.1"
 objc2 = "0.6.5"
 objc_id = "0.1.1"
+plist = "1.10.3"
 rand = "0.10.3"
 rand_core = "0.10.1"
 screencapturekit = "11.1.2"
@@ -25,3 +27,4 @@ serde_json = "1"
 sha2 = "0.10"
 srp = "0.6.0"
 tokio = { version = "1", features = ["full"] }
+uuid = { version = "1.29.0", features = ["v4"] }

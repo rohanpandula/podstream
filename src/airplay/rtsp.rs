@@ -22,6 +22,10 @@ impl RtspClient {
         self.stream
     }
 
+    pub fn local_ip(&self) -> std::io::Result<std::net::IpAddr> {
+        Ok(self.stream.local_addr()?.ip())
+    }
+
     pub fn connect(host: &str, port: u16) -> Result<Self> {
         let stream = TcpStream::connect((host, port))
             .with_context(|| format!("connecting to {host}:{port}"))?;
