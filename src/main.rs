@@ -34,6 +34,10 @@ enum Command {
     Pair {
         host: String,
     },
+    /// Pair and send one encrypted request over the control channel
+    Probe {
+        host: String,
+    },
     /// Capture system audio for N seconds and print stats (test capture)
     TestCapture {
         #[arg(long, default_value_t = 3)]
@@ -81,6 +85,20 @@ async fn main() -> Result<()> {
                 hex::encode(keys.read_key),
                 hex::encode(keys.write_key)
             );
+            Ok(())
+        }
+        Command::Probe { host } => {
+            let (host, port) = match host.rsplit_once(':') {
+                Some((h, p)) => (h.to_string(), p.parse::<u16>().unwrap_or(7000)),
+                None => (host, 7000),
+            };
+            let mut pair = airplay::pair::PairSetupClient::new(&host, port)?;
+            let _keys = pair.pair()?;
+            let mut channel = pair.into_encrypted();
+            // POST /feedback is used as a keepalive; any authenticated
+            // reply proves the whole encrypted channel works.
+            let resp = channel.request("POST", "/feedback", &[], b"")?;
+            println!("decrypted response ({} bytes):\n{}", resp.len(), resp);
             Ok(())
         }
         Command::TestCapture { seconds } => {

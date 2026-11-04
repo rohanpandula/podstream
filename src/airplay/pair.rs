@@ -16,6 +16,7 @@ use anyhow::{bail, Context, Result};
 use hkdf::Hkdf;
 
 use sha2::Sha512;
+use super::crypto::EncryptedChannel;
 use super::rtsp::RtspClient;
 use super::srp::SrpClient;
 use super::tlv::Tlv;
@@ -125,5 +126,13 @@ impl PairSetupClient {
         self.write_key = Some(write_key);
         self.read_key = Some(read_key);
         Ok(PairingKeys { read_key, write_key })
+    }
+
+    /// Take the raw TCP stream (after pairing) and wrap it in the
+    /// encrypted control channel.
+    pub fn into_encrypted(self) -> EncryptedChannel {
+        let w = self.write_key.expect("pair() first");
+        let r = self.read_key.expect("pair() first");
+        EncryptedChannel::new(self.client.into_stream(), w, r)
     }
 }

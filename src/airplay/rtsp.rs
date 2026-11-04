@@ -18,6 +18,10 @@ pub struct RtspResponse {
 }
 
 impl RtspClient {
+    pub fn into_stream(self) -> std::net::TcpStream {
+        self.stream
+    }
+
     pub fn connect(host: &str, port: u16) -> Result<Self> {
         let stream = TcpStream::connect((host, port))
             .with_context(|| format!("connecting to {host}:{port}"))?;
