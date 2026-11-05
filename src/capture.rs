@@ -52,6 +52,48 @@ impl UnsafeSCStreamOutput for OutputHandler {
     }
 }
 
+/// Stream system audio indefinitely; invokes `f` on every frame until
+/// `stop` is set. Requires Screen Recording permission.
+pub fn capture_stream<F>(stop: &std::sync::atomic::AtomicBool, mut f: F) -> Result<()>
+where
+    F: FnMut(&AudioFrame) + Send + 'static,
+{
+    let content = unsafe { UnsafeSCShareableContent::get() }
+        .map_err(|e| anyhow::anyhow!("SCShareableContent: {e:?}"))
+        .context("screen recording permission may be missing")?;
+
+    let display = unsafe { content.displays() }
+        .pop()
+        .ok_or_else(|| anyhow::anyhow!("no display found"))?;
+    let filter = unsafe { UnsafeContentFilter::init(UnsafeInitParams::Display(display)) };
+
+    let config = UnsafeStreamConfiguration {
+        width: 2,
+        height: 2,
+        captures_audio: 1,
+        excludes_current_process_audio: 1,
+        queue_depth: 8,
+        ..Default::default()
+    };
+
+    let (tx, rx) = sync_channel::<AudioFrame>(4096);
+    let stream = unsafe {
+        UnsafeSCStream::init(filter, config.into(), ErrorHandler {})
+    };
+    unsafe { stream.add_stream_output(OutputHandler { tx }, 1) }; // 1 = audio
+    unsafe { stream.start_capture() }.map_err(|e| anyhow::anyhow!("start: {e}"))?;
+
+    let _keep = &stream;
+    while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+        match rx.recv_timeout(Duration::from_millis(200)) {
+            Ok(frame) => f(&frame),
+            Err(_) => continue,
+        }
+    }
+    unsafe { stream.stop_capture() }.map_err(|e| anyhow::anyhow!("stop: {e}"))?;
+    Ok(())
+}
+
 /// Capture system audio for `duration`, invoking `f` on every frame.
 /// Requires Screen Recording permission (System Settings > Privacy > Screen Recording).
 pub fn capture<F: FnMut(&AudioFrame) + Send + 'static>(duration: Duration, mut f: F) -> Result<()> {
@@ -87,8 +129,6 @@ pub fn capture<F: FnMut(&AudioFrame) + Send + 'static>(duration: Duration, mut f
     }
 
     unsafe { stream.stop_capture() }.map_err(|e| anyhow::anyhow!("stop: {e}"))?;
-    // Keep the stream alive until here.
-    let _keep: Arc<()> = Arc::new(());
     drop(stream);
     Ok(())
 }

@@ -5,3 +5,4 @@ pub mod srp;
 pub mod crypto;
 pub mod session;
 pub mod timing;
+pub mod audio;

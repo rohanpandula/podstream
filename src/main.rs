@@ -34,6 +34,13 @@ enum Command {
     Pair {
         host: String,
     },
+    /// Stream the Mac's system audio to a receiver
+    Connect {
+        host: String,
+        /// Stop after N seconds (default: run until Ctrl-C)
+        #[arg(long)]
+        seconds: Option<u64>,
+    },
     /// Pair, negotiate the session (both SETUP phases), report ports
     Setup { host: String },
     /// Pair and send one encrypted request over the control channel
@@ -44,11 +51,6 @@ enum Command {
     TestCapture {
         #[arg(long, default_value_t = 3)]
         seconds: u64,
-    },
-    /// Connect to a receiver and start streaming (placeholder)
-    Connect {
-        /// Receiver name (from `discover`) or index
-        name: String,
     },
     /// Stop streaming (placeholder)
     Disconnect,
@@ -92,6 +94,124 @@ async fn main() -> Result<()> {
                 "pair-setup complete: read_key {} write_key {}",
                 hex::encode(keys.read_key),
                 hex::encode(keys.write_key)
+            );
+            Ok(())
+        }
+        Command::Connect { host, seconds } => {
+            let (host, port) = match host.rsplit_once(':') {
+                Some((h, p)) => (h.to_string(), p.parse::<u16>().unwrap_or(7000)),
+                None => (host, 7000),
+            };
+
+            // 1. Pair and negotiate the session.
+            let pair = airplay::pair::PairSetupClient::new(&host, port)?;
+            let channel = pair.into_encrypted_after_pair()?;
+            let local_ip = channel_local_ip(&channel);
+
+            let timing = std::net::UdpSocket::bind("0.0.0.0:0")?;
+            let timing_port = timing.local_addr()?.port();
+            let _timing_stop = airplay::timing::spawn_responder(timing);
+            let control = std::net::UdpSocket::bind("0.0.0.0:0")?;
+            let control_port = control.local_addr()?.port();
+
+            let device_id = "AA:BB:CC:DD:EE:FF".to_string();
+            let mut session = airplay::session::Session::new(
+                channel,
+                &host,
+                port,
+                local_ip.clone(),
+                device_id,
+            );
+            session.setup_phase1(timing_port)?;
+            let _events = session.connect_events()?;
+            let shk: [u8; 32] = rand::random();
+            session.setup_phase2(control_port, shk)?;
+            session.record()?;
+            let data_port = session
+                .data_port
+                .ok_or_else(|| anyhow::anyhow!("no data port"))?;
+            let recv_control_port = session.control_port.unwrap_or(control_port);
+            println!(
+                "streaming to {host}: data_port={data_port} control_port={recv_control_port}"
+            );
+
+            // 2. Stream audio.
+            let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let mut sender =
+                airplay::audio::AudioSender::new(control, shk, &host, data_port, recv_control_port);
+
+            // audio socket must be separate from control? reuse control socket for data too is fine for send_to.
+            let stats = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+            let start = std::time::Instant::now();
+
+            // resampler state: 48k capture -> 44.1k stream, linear interpolation
+            let mut pcm_out: Vec<i16> = Vec::new(); // interleaved stereo
+            let mut phase: f64 = 0.0; // fractional position in input samples
+            let step = 48000.0 / 44100.0;
+
+            let stats2 = stats.clone();
+            let host2 = host.clone();
+            // stop after --seconds
+            let stats3 = stats.clone();
+            let stop3 = stop.clone();
+            let monitor = std::thread::spawn(move || {
+                let deadline = seconds.map(|s| std::time::Duration::from_secs(s));
+                let t0 = std::time::Instant::now();
+                loop {
+                    std::thread::sleep(std::time::Duration::from_secs(1));
+                    if stop3.load(std::sync::atomic::Ordering::Relaxed) {
+                        break;
+                    }
+                    if let Some(d) = deadline {
+                        if t0.elapsed() >= d {
+                            stop3.store(true, std::sync::atomic::Ordering::Relaxed);
+                            break;
+                        }
+                    }
+                    eprintln!(
+                        "streamed {} frames ({:.1}s)",
+                        stats3.load(std::sync::atomic::Ordering::Relaxed),
+                        t0.elapsed().as_secs_f64()
+                    );
+                }
+            });
+            let res = capture::capture_stream(&stop, move |frame| {
+                // frame.data: interleaved f32 (stereo). Resample 48k -> 44.1k
+                // with linear interpolation, carrying the fractional position
+                // across input buffers.
+                let input = &frame.data;
+                let pairs = input.len() / 2;
+                if pairs < 2 {
+                    return;
+                }
+                while (phase as usize) + 1 < pairs {
+                    let k = phase as usize;
+                    let frac = (phase - k as f64) as f32;
+                    let l = input[2 * k] + (input[2 * k + 2] - input[2 * k]) * frac;
+                    let r = input[2 * k + 1] + (input[2 * k + 3] - input[2 * k + 1]) * frac;
+                    pcm_out.push((l.clamp(-1.0, 1.0) * 32767.0) as i16);
+                    pcm_out.push((r.clamp(-1.0, 1.0) * 32767.0) as i16);
+                    phase += step;
+                    // send when we have a full frame (352 stereo samples)
+                    while pcm_out.len() >= 704 {
+                        let chunk: Vec<u8> = pcm_out
+                            .drain(..704)
+                            .flat_map(|s| s.to_le_bytes())
+                            .collect();
+                        let _ = sender.send_frame_to(&chunk, &host2);
+                        stats2.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                }
+                // carry the unconsumed fractional position into the next buffer
+                phase -= pairs as f64;
+            });
+
+            let _ = monitor.join();
+            res?;
+            println!(
+                "done: {} audio frames in {:.1}s",
+                stats.load(std::sync::atomic::Ordering::Relaxed),
+                start.elapsed().as_secs_f64()
             );
             Ok(())
         }
@@ -167,10 +287,6 @@ async fn main() -> Result<()> {
                 .and_then(|m| m.into_inner().ok())
                 .unwrap_or_default();
             println!("captured {frames} frames, {samples} samples, channels={sr}");
-            Ok(())
-        }
-        Command::Connect { name } => {
-            println!("connect: not implemented yet (receiver: {name})");
             Ok(())
         }
         Command::Disconnect => {
