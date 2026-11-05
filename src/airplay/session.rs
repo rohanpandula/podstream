@@ -198,6 +198,23 @@ impl Session {
         Ok(())
     }
 
+    /// Set receiver volume in dB (-30.0 .. 0.0, 0 = max).
+    pub fn set_volume(&mut self, db: f64) -> Result<()> {
+        let body = format!("volume: {db:.6}\r\n");
+        let (status, _headers, _body) = self
+            .request(
+                "SET_PARAMETER",
+                &self.uri(),
+                Some("text/parameters"),
+                body.as_bytes(),
+            )
+            .context("SET_PARAMETER volume")?;
+        if status != 200 {
+            bail!("SET_PARAMETER volume failed: {status}");
+        }
+        Ok(())
+    }
+
     /// Connect to the receiver's event port (reverse event channel).
     pub fn connect_events(&self) -> Result<TcpStream> {
         let port = self.event_port.context("no event port from SETUP phase 1")?;

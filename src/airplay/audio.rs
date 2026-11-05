@@ -1,22 +1,20 @@
-//! Realtime (type 96) audio RTP streaming.
+//! Realtime (type 96) audio RTP streaming + sync (PT 84) packets.
 //!
-//! Packet: [RTP header (12B)][ChaCha20-Poly1305 ciphertext][tag (16B)][nonce (8B)]
+//! Audio packet: [RTP header (12B)][ChaCha20-Poly1305 ciphertext][tag (16B)][nonce (8B)]
 //! - key = shk from SETUP phase 2
 //! - AAD = RTP timestamp (4B BE) || SSRC (4B BE)
 //! - nonce = 12 bytes, seq (u16 LE) at offset 4; last 8 bytes transmitted
-//! - marker bit set on the first packet
 //!
-//! Sync packets (PT 84) go to the control port once per second.
+//! Sync packet (20B, observed from a working sender):
+//!   [0]=0x80 [1]=0xd4 [2..4]=seq [4..8]=current rtptime
+//!   [8..12]=NTP seconds [12..16]=NTP fraction [16..20]=next rtptime
 
 use anyhow::Result;
 use chacha20poly1305::aead::{Aead, KeyInit, Payload};
 use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
 use std::net::UdpSocket;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
 
 pub const PAYLOAD_TYPE: u8 = 96;
-pub const SYNC_TYPE: u8 = 84;
 pub const SAMPLES_PER_FRAME: u32 = 352;
 pub const SAMPLE_RATE: u32 = 44100;
 
@@ -26,53 +24,34 @@ pub struct AudioSender {
     data_port: u16,
     control_port: u16,
     seq: u16,
+    sync_seq: u16,
     ssrc: u32,
     /// RTP timestamp of the next frame (44.1kHz clock).
     pub rtptime: u32,
-    first: bool,
 }
 
 impl AudioSender {
-    pub fn new(sock: UdpSocket, shk: [u8; 32], host: &str, data_port: u16, control_port: u16) -> Self {
+    pub fn new(sock: UdpSocket, shk: [u8; 32], data_port: u16, control_port: u16) -> Self {
         let ssrc = rand::random::<u32>() | 1;
+        // Match a working sender: do not start at zero.
+        let seq: u16 = rand::random::<u16>().wrapping_add(9000);
         AudioSender {
             sock,
             cipher: ChaCha20Poly1305::new(Key::from_slice(&shk)),
             data_port,
             control_port,
-            seq: 0,
+            seq,
+            sync_seq: rand::random::<u16>(),
             ssrc,
-            rtptime: 4366,
-            first: true,
+            rtptime: 1_418_702,
         }
-    }
-
-    /// Send a sync (PT 84) packet: correlates RTP timestamps to NTP time.
-    pub fn send_sync(&mut self) -> Result<()> {
-        let mut pkt = [0u8; 20];
-        pkt[0] = 0x80;
-        pkt[1] = 0x80 | SYNC_TYPE; // marker set
-        pkt[2..4].copy_from_slice(&self.seq.to_be_bytes());
-        // NTP now
-        let (sec, frac) = ntp_now();
-        pkt[8..12].copy_from_slice(&sec.to_be_bytes());
-        pkt[12..16].copy_from_slice(&frac.to_be_bytes());
-        // RTP timestamp for the next audio packet
-        pkt[16..20].copy_from_slice(&self.rtptime.to_be_bytes());
-        self.sock
-            .send_to(&pkt, ("0.0.0.0", self.control_port))
-            .map_err(|e| anyhow::anyhow!("send sync: {e}"))?;
-        Ok(())
     }
 
     /// Encrypt and send one frame of interleaved s16 stereo samples to `host`.
     pub fn send_frame_to(&mut self, pcm: &[u8], host: &str) -> Result<()> {
-        let marker = if self.first { 0x80 } else { 0x00 };
-        self.first = false;
-
         let mut header = [0u8; 12];
         header[0] = 0x80;
-        header[1] = marker | PAYLOAD_TYPE;
+        header[1] = PAYLOAD_TYPE;
         header[2..4].copy_from_slice(&self.seq.to_be_bytes());
         header[4..8].copy_from_slice(&self.rtptime.to_be_bytes());
         header[8..12].copy_from_slice(&self.ssrc.to_be_bytes());
@@ -86,7 +65,13 @@ impl AudioSender {
 
         let ct = self
             .cipher
-            .encrypt(&Nonce::from(nonce), Payload { msg: pcm, aad: &aad })
+            .encrypt(
+                &Nonce::from(nonce),
+                Payload {
+                    msg: pcm,
+                    aad: &aad,
+                },
+            )
             .map_err(|_| anyhow::anyhow!("audio encrypt failed"))?;
 
         let mut packet = Vec::with_capacity(12 + ct.len() + 8);
@@ -101,6 +86,24 @@ impl AudioSender {
         self.rtptime = self.rtptime.wrapping_add(SAMPLES_PER_FRAME);
         Ok(())
     }
+
+    /// Send a sync (PT 84) packet to the receiver's control port.
+    pub fn send_sync(&mut self, host: &str) -> Result<()> {
+        let mut pkt = [0u8; 20];
+        pkt[0] = 0x80;
+        pkt[1] = 0xd4;
+        pkt[2..4].copy_from_slice(&self.sync_seq.to_be_bytes());
+        pkt[4..8].copy_from_slice(&self.rtptime.to_be_bytes());
+        let (sec, frac) = ntp_now();
+        pkt[8..12].copy_from_slice(&sec.to_be_bytes());
+        pkt[12..16].copy_from_slice(&frac.to_be_bytes());
+        pkt[16..20].copy_from_slice(&self.rtptime.to_be_bytes());
+        self.sock
+            .send_to(&pkt, (host, self.control_port))
+            .map_err(|e| anyhow::anyhow!("send sync: {e}"))?;
+        self.sync_seq = self.sync_seq.wrapping_add(1);
+        Ok(())
+    }
 }
 
 fn ntp_now() -> (u32, u32) {
@@ -112,11 +115,4 @@ fn ntp_now() -> (u32, u32) {
         (now.as_secs() + NTP_EPOCH_DELTA) as u32,
         (now.subsec_nanos() as u64 * u32::MAX as u64 / 1_000_000_000) as u32,
     )
-}
-
-/// Shared counters for the streaming loop.
-pub struct StreamStats {
-    pub frames: AtomicU64,
-    pub bytes: AtomicU64,
-    pub running: Arc<AtomicBool>,
 }

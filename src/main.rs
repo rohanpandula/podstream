@@ -127,6 +127,9 @@ async fn main() -> Result<()> {
             let shk: [u8; 32] = rand::random();
             session.setup_phase2(control_port, shk)?;
             session.record()?;
+            session.set_volume(0.0)?;
+
+            println!("volume set to max");
             let data_port = session
                 .data_port
                 .ok_or_else(|| anyhow::anyhow!("no data port"))?;
@@ -137,8 +140,15 @@ async fn main() -> Result<()> {
 
             // 2. Stream audio.
             let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-            let mut sender =
-                airplay::audio::AudioSender::new(control, shk, &host, data_port, recv_control_port);
+            let sender = std::sync::Arc::new(std::sync::Mutex::new(
+                airplay::audio::AudioSender::new(control, shk, data_port, recv_control_port),
+            ));
+            // immediate sync packets so the receiver can align playback
+            {
+                let mut snd = sender.lock().unwrap();
+                let _ = snd.send_sync(&host);
+                let _ = snd.send_sync(&host);
+            }
 
             // audio socket must be separate from control? reuse control socket for data too is fine for send_to.
             let stats = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
@@ -154,6 +164,8 @@ async fn main() -> Result<()> {
             // stop after --seconds
             let stats3 = stats.clone();
             let stop3 = stop.clone();
+            let sender_sync = sender.clone();
+            let host_sync = host.clone();
             let monitor = std::thread::spawn(move || {
                 let deadline = seconds.map(|s| std::time::Duration::from_secs(s));
                 let t0 = std::time::Instant::now();
@@ -167,6 +179,10 @@ async fn main() -> Result<()> {
                             stop3.store(true, std::sync::atomic::Ordering::Relaxed);
                             break;
                         }
+                    }
+                    {
+                        let mut snd = sender_sync.lock().unwrap();
+                        let _ = snd.send_sync(&host_sync);
                     }
                     eprintln!(
                         "streamed {} frames ({:.1}s)",
@@ -198,7 +214,7 @@ async fn main() -> Result<()> {
                             .drain(..704)
                             .flat_map(|s| s.to_le_bytes())
                             .collect();
-                        let _ = sender.send_frame_to(&chunk, &host2);
+                        let _ = sender.lock().unwrap().send_frame_to(&chunk, &host2);
                         stats2.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     }
                 }
