@@ -66,9 +66,11 @@ enum Command {
     },
 }
 
-fn channel_local_ip(_c: &airplay::crypto::EncryptedChannel) -> String {
+fn channel_local_ip(host: &str) -> String {
+    // The IP we use to reach the receiver -> the address carried in the
+    // SETUP URI, so the receiver knows where to send audio/timing.
     let sock = std::net::UdpSocket::bind("0.0.0.0:0").unwrap();
-    sock.connect("10.0.0.204:7000").unwrap();
+    sock.connect(host).unwrap();
     sock.local_addr().unwrap().ip().to_string()
 }
 
@@ -106,7 +108,7 @@ async fn main() -> Result<()> {
             // 1. Pair and negotiate the session.
             let pair = airplay::pair::PairSetupClient::new(&host, port)?;
             let channel = pair.into_encrypted_after_pair()?;
-            let local_ip = channel_local_ip(&channel);
+            let local_ip = channel_local_ip(&format!("{host}:{port}"));
 
             let timing = std::net::UdpSocket::bind("0.0.0.0:0")?;
             let timing_port = timing.local_addr()?.port();
@@ -146,8 +148,15 @@ async fn main() -> Result<()> {
             // immediate sync packets so the receiver can align playback
             {
                 let mut snd = sender.lock().unwrap();
-                let _ = snd.send_sync(&host);
-                let _ = snd.send_sync(&host);
+                // Prime the jitter buffer with silence + syncs so playback
+                // doesn't start on the first real frame.
+                for _ in 0..8 {
+                    let silence = vec![0u8; 704 * 2];
+                    let _ = snd.send_frame_to(&silence, &host);
+                }
+                for _ in 0..3 {
+                    let _ = snd.send_sync(&host);
+                }
             }
 
             // audio socket must be separate from control? reuse control socket for data too is fine for send_to.
@@ -182,7 +191,9 @@ async fn main() -> Result<()> {
                     }
                     {
                         let mut snd = sender_sync.lock().unwrap();
-                        let _ = snd.send_sync(&host_sync);
+                        if let Err(e) = snd.send_sync(&host_sync) {
+                            eprintln!("sync send err: {e}");
+                        }
                     }
                     eprintln!(
                         "streamed {} frames ({:.1}s)",
@@ -208,14 +219,25 @@ async fn main() -> Result<()> {
                     pcm_out.push((l.clamp(-1.0, 1.0) * 32767.0) as i16);
                     pcm_out.push((r.clamp(-1.0, 1.0) * 32767.0) as i16);
                     phase += step;
-                    // send when we have a full frame (352 stereo samples)
+                    // Pace output to the realtime rate: 352 samples @ 44.1k =
+                    // 7.98ms per frame. Without this, SCK bursts overflow the
+                    // receiver's jitter buffer -> static/noise.
+                    let mut next = std::time::Instant::now();
                     while pcm_out.len() >= 704 {
                         let chunk: Vec<u8> = pcm_out
                             .drain(..704)
                             .flat_map(|s| s.to_le_bytes())
                             .collect();
-                        let _ = sender.lock().unwrap().send_frame_to(&chunk, &host2);
+                        let _ = match sender.lock().unwrap().send_frame_to(&chunk, &host2) {
+                            Ok(_) => {},
+                            Err(e) => eprintln!("audio send err: {e}"),
+                        };
                         stats2.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        next += std::time::Duration::from_micros(7980);
+                        let now = std::time::Instant::now();
+                        if now < next {
+                            std::thread::sleep(next - now);
+                        }
                     }
                 }
                 // carry the unconsumed fractional position into the next buffer
@@ -247,7 +269,7 @@ async fn main() -> Result<()> {
 
             let device_id = "AA:BB:CC:DD:EE:FF".to_string();
             let channel = pair.into_encrypted_after_pair()?;
-            let local_ip = channel_local_ip(&channel);
+            let local_ip = channel_local_ip(&format!("{host}:{port}"));
             let mut session = airplay::session::Session::new(
                 channel,
                 &host,
@@ -324,3 +346,4 @@ async fn main() -> Result<()> {
         }
     }
 }
+

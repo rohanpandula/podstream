@@ -34,15 +34,36 @@ struct OutputHandler {
 impl UnsafeSCStreamOutput for OutputHandler {
     fn did_output_sample_buffer(&self, sample: objc_id::Id<CMSampleBufferRef>, _of_type: u8) {
         let buffers = sample.get_av_audio_buffer_list();
-        let mut data = Vec::new();
-        let mut channels = 2u32;
+        // SCK may deliver interleaved (1 buffer, N channels) or planar
+        // (N buffers, 1 channel each). Decode each into f32 and rebuild
+        // clean interleaved L/R in case.
+        let mut planes: Vec<Vec<f32>> = Vec::new();
+        let mut channels = 1u32;
         for b in buffers {
             channels = b.number_channels.max(1);
-            data.extend(
-                b.data
-                    .chunks_exact(4)
-                    .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])),
-            );
+            let floats: Vec<f32> = b
+                .data
+                .chunks_exact(4)
+                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect();
+            if !floats.is_empty() {
+                planes.push(floats);
+            }
+        }
+        let mut data = Vec::new();
+        if planes.len() == 1 {
+            // interleaved as-is
+            data = planes.remove(0);
+        } else if planes.len() > 1 {
+            // planar -> interleave sample-by-sample
+            let frames = planes.iter().map(|p| p.len()).min().unwrap_or(0);
+            data.reserve(frames * planes.len());
+            for i in 0..frames {
+                for p in &planes {
+                    data.push(p[i]);
+                }
+            }
+            channels = planes.len() as u32;
         }
         let _ = self.tx.send(AudioFrame {
             pts: sample.get_presentation_timestamp().value,

@@ -28,30 +28,50 @@ pub struct AudioSender {
     ssrc: u32,
     /// RTP timestamp of the next frame (44.1kHz clock).
     pub rtptime: u32,
+    /// RTP-time playback latency ahead of `rtptime`. The sync packet's
+    /// "next RTP timestamp" must be `rtptime + latency` so the receiver
+    /// knows it has `latency` samples to buffer. Setting it to `rtptime`
+    /// (0 latency) makes the HomePod play with a 0-sample buffer -> static.
+    latency: u32,
+    /// Set on the first audio frame (RTP marker bit).
+    first_audio: bool,
+    /// Set on the first sync packet (extension bit, after RECORD).
+    first_sync: bool,
 }
 
 impl AudioSender {
-    pub fn new(sock: UdpSocket, shk: [u8; 32], data_port: u16, control_port: u16) -> Self {
-        let ssrc = rand::random::<u32>() | 1;
-        // Match a working sender: do not start at zero.
-        let seq: u16 = rand::random::<u16>().wrapping_add(9000);
-        AudioSender {
+    pub fn new(
+        sock: UdpSocket,
+        shk: [u8; 32],
+        data_port: u16,
+        control_port: u16,
+    ) -> Self {
+        Self {
             sock,
             cipher: ChaCha20Poly1305::new(Key::from_slice(&shk)),
             data_port,
             control_port,
-            seq,
+            seq: rand::random::<u16>().wrapping_add(9000),
             sync_seq: rand::random::<u16>(),
-            ssrc,
+            ssrc: rand::random::<u32>() | 1,
             rtptime: 1_418_702,
+            latency: 88_200, // 2s of 44.1k samples, the phase-2 latencyMax
+            first_audio: true,
+            first_sync: true,
         }
     }
+
+    /// Set the playback latency in RTP-time samples (receiver jitter buffer).
+    pub fn set_latency(&mut self, latency: u32) { self.latency = latency; }
 
     /// Encrypt and send one frame of interleaved s16 stereo samples to `host`.
     pub fn send_frame_to(&mut self, pcm: &[u8], host: &str) -> Result<()> {
         let mut header = [0u8; 12];
         header[0] = 0x80;
-        header[1] = PAYLOAD_TYPE;
+        // Marker bit set on the first audio frame so the receiver anchors
+        // its jitter buffer to the stream start.
+        header[1] = if self.first_audio { 0x80 | PAYLOAD_TYPE } else { PAYLOAD_TYPE };
+        self.first_audio = false;
         header[2..4].copy_from_slice(&self.seq.to_be_bytes());
         header[4..8].copy_from_slice(&self.rtptime.to_be_bytes());
         header[8..12].copy_from_slice(&self.ssrc.to_be_bytes());
@@ -91,17 +111,22 @@ impl AudioSender {
     pub fn send_sync(&mut self, host: &str) -> Result<()> {
         let mut pkt = [0u8; 20];
         pkt[0] = 0x80;
-        pkt[1] = 0xd4;
+        // Extension bit (0x10) on the first sync packet after RECORD.
+        pkt[1] = if self.first_sync { 0x10 | 0xd4 } else { 0xd4 };
+        self.first_sync = false;
         pkt[2..4].copy_from_slice(&self.sync_seq.to_be_bytes());
         pkt[4..8].copy_from_slice(&self.rtptime.to_be_bytes());
         let (sec, frac) = ntp_now();
         pkt[8..12].copy_from_slice(&sec.to_be_bytes());
         pkt[12..16].copy_from_slice(&frac.to_be_bytes());
-        pkt[16..20].copy_from_slice(&self.rtptime.to_be_bytes());
+        // "next" RTP timestamp = current + latency, NOT current. Tells the
+        // receiver it has `latency` samples buffered before playback.
+        pkt[16..20].copy_from_slice(&self.rtptime.wrapping_add(self.latency).to_be_bytes());
         self.sock
             .send_to(&pkt, (host, self.control_port))
             .map_err(|e| anyhow::anyhow!("send sync: {e}"))?;
         self.sync_seq = self.sync_seq.wrapping_add(1);
+        // Once audio frames start flowing, clear the extension/marker primacy.
         Ok(())
     }
 }

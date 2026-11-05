@@ -44,7 +44,7 @@ pub fn spawn_responder(socket: UdpSocket) -> Arc<AtomicBool> {
                     let mut res = [0u8; 32];
                     res[0] = 0x80;
                     res[1] = 0xd3;
-                    res[2] = buf[2];
+                    res[2..4].copy_from_slice(&buf[2..4]);
                     // Echo the client's transmit timestamp.
                     res[8..16].copy_from_slice(&buf[24..32]);
                     let (sec, frac) = ntp_now();

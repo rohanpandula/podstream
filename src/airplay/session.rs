@@ -87,12 +87,16 @@ impl Session {
         msg.extend_from_slice(body);
         self.channel.send(&msg)?;
         let resp = self.channel.recv()?;
-        let text = String::from_utf8_lossy(&resp).to_string();
-        let (headers_part, body_part) = match text.find("\r\n\r\n") {
-            Some(i) => (&text[..i], resp[i + 4..].to_vec()),
-            None => (&text[..], Vec::new()),
-        };
-        let mut lines = headers_part.lines();
+        // Find the header/body boundary in the raw bytes, NOT via a
+        // lossy-UTF8 string (binary plist bodies are not UTF-8).
+        let sep = resp
+            .windows(4)
+            .position(|w| w == b"\r\n\r\n")
+            .ok_or_else(|| anyhow::anyhow!("no header terminator in response"))?;
+        let headers_bytes = &resp[..sep];
+        let body_part = resp[sep + 4..].to_vec();
+        let text = String::from_utf8_lossy(headers_bytes).to_string();
+        let mut lines = text.lines();
         let status_line = lines.next().unwrap_or_default();
         let status: u16 = status_line
             .split_whitespace()
@@ -103,7 +107,7 @@ impl Session {
             .filter_map(|l| l.split_once(':').map(|(k, v)| (k.trim().to_string(), v.trim().to_string())))
             .collect();
         if self.debug_next {
-            eprintln!("--- raw response ---\n{headers_part}\n--- end ---");
+            eprintln!("--- raw response ---\n{text}\n--- end ---");
             self.debug_next = false;
         }
         Ok((status, headers, body_part))
